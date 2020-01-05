@@ -1,2 +1,2 @@
 # aws-samples
-sample aws code
+Cloudformation template to create datalake on S3

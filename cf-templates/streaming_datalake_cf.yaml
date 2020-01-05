@@ -1,0 +1,454 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Cloudformation template to create datalake in S3 and Query through Athena"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: DV
+    AllowedValues:
+      - DV
+      - QA
+      - PD
+
+Mappings:
+  EnvMap:
+    PD:
+      EnvLower: "pd"
+      EnvUpper: "PD"
+    QA:
+      EnvLower: "qa"
+      EnvUpper: "QA"
+    DV:
+      EnvLower: "dv"
+      EnvUpper: "DV"
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-Sample-Lambda-Role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - apigateway.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser
+      Policies:
+        - PolicyName: AllowWriteToKinesis
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:DescribeStream
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListStreams
+                Resource: !Sub arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${Environment}-Sample-Events-Stream
+        - PolicyName: AllowKMSKeyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: KeyAccess
+                Effect: Allow
+                Action:
+                  - kms:List*
+                Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:*
+              - Sid: LambdaKeyAccess
+                Effect: Allow
+                Action:
+                  - kms:List*
+                  - kms:Create*
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:Describe*
+                  - kms:Generate*
+                  - kms:ReEncrypt*
+                  - kms:UpdateAlias
+                  - kms:UpdateKeyDescription
+                Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:*
+
+  PushEventsToKinesisLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "push-events-to-kinesis-lambda"
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          var kinesis = new AWS.Kinesis();        
+          exports.handler = function(event, context, callback) {
+          var record = {
+              Data: JSON.stringify(event),
+              PartitionKey: String(Date.now())
+          };
+          var records = [];
+          records.push(record);
+          var recordsParams = {
+              Records: records,
+              StreamName: "DV-Sample-Events-Stream"
+          };   
+          kinesis.putRecords(recordsParams, function(err, data) {
+              if (err) {
+              callback(err);
+              console.log("error:", err);
+              } else {
+              console.log("sucess", data);
+              callback(null, data);
+              }
+          });
+          };
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs10.x
+      Timeout: 60
+
+  KinesisKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key for the Sample Kinesis Stream
+      EnableKeyRotation: true
+      Enabled: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-lambda
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: "*"
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+  SampleBucketKmsKey:
+    Type: AWS::KMS::Key
+    DependsOn: KinesisS3DeliveryStreamRole
+    Properties:
+      Description: Key for the Sample S3 Bucket
+      EnableKeyRotation: true
+      Enabled: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: "*"
+          - Sid: Allow use of the key.
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${Environment}-Sample-Kinesis-S3-Delivery-Stream-Role"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+  SampleEventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub ${Environment}-Sample-Events-Stream
+      ShardCount: 1
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref KinesisKmsKey
+
+  SampleEventsBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub
+        - "${EnvLower}-sample-events-${AWS::AccountId}"
+        - EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref SampleBucketKmsKey
+              SSEAlgorithm: "aws:kms"
+
+  SampleEventsRawBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub
+        - "${EnvLower}-sample-events-${AWS::AccountId}-raw"
+        - EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower]
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpiryRule
+            Status: Enabled
+            ExpirationInDays: "30"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref SampleBucketKmsKey
+              SSEAlgorithm: "aws:kms"
+
+  KinesisS3DeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-Sample-Kinesis-S3-Delivery-Stream-Role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        - PolicyName: !Sub "${Environment}-Sample-Kinesis-S3-Delivery-Stream-Policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersions
+                  - glue:GetTableVersion
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${EnvLower}-sample-events-${AWS::AccountId}"
+                    - EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower]
+                  - !Sub
+                    - "arn:aws:s3:::${EnvLower}-sample-events-${AWS::AccountId}/*"
+                    - EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower]
+                  - !Sub
+                    - "arn:aws:s3:::${EnvLower}-sample-events-${AWS::AccountId}-raw"
+                    - EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower]
+                  - !Sub
+                    - "arn:aws:s3:::${EnvLower}-sample-events-${AWS::AccountId}-raw/*"
+                    - EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower]
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                Resource:
+                  - !Sub arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${Environment}-Sample-Events-Stream
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - !GetAtt KinesisKmsKey.Arn
+
+  SampleEventsFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: KinesisS3DeliveryStreamRole
+    Properties:
+      DeliveryStreamName: !Sub ${Environment}-Sample-Events-Firehose-S3
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt SampleEventsStream.Arn
+        RoleARN: !GetAtt KinesisS3DeliveryStreamRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt SampleEventsBucket.Arn
+        Prefix: "year=!{timestamp:YYYY}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+        ErrorOutputPrefix: "!{firehose:error-output-type}/year=!{timestamp:YYYY}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        CompressionFormat: UNCOMPRESSED
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !GetAtt SampleBucketKmsKey.Arn
+        S3BackupMode: Enabled
+        S3BackupConfiguration:
+          BucketARN: !GetAtt SampleEventsRawBucket.Arn
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 1
+          CompressionFormat: UNCOMPRESSED
+          EncryptionConfiguration:
+            KMSEncryptionConfig:
+              AWSKMSKeyARN: !GetAtt SampleBucketKmsKey.Arn
+          Prefix: "year=!{timestamp:YYYY}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+          ErrorOutputPrefix: "!{firehose:error-output-type}/year=!{timestamp:YYYY}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+          RoleARN: !GetAtt KinesisS3DeliveryStreamRole.Arn
+        RoleARN: !GetAtt KinesisS3DeliveryStreamRole.Arn
+        DataFormatConversionConfiguration:
+          SchemaConfiguration:
+            CatalogId: !Ref AWS::AccountId
+            RoleARN: !GetAtt KinesisS3DeliveryStreamRole.Arn
+            DatabaseName: !Ref SampleEventsGlueDatabase
+            TableName: !Ref SampleEventsGlueTable
+            Region: !Ref AWS::Region
+            VersionId: LATEST
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe: {}
+          Enabled: True
+
+  SampleEventsGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Database for Sample Tables
+        Name: !Sub
+          - ${EnvLower}-sample-events-db
+          - { EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower] }
+
+  SampleEventsGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref SampleEventsGlueDatabase
+      TableInput:
+        Description: Table for Sample
+        TableType: EXTERNAL_TABLE
+        Parameters: { "classification": "parquet", "compressionType": "none" }
+        Name: !Sub
+          - "${EnvLower}_sample_events_${AWS::AccountId}"
+          - EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower]
+        PartitionKeys:
+          - Name: year
+            Type: bigint
+          - Name: month
+            Type: bigint
+          - Name: day
+            Type: bigint
+          - Name: hour
+            Type: bigint
+        StorageDescriptor:
+          Columns:
+            - Name: event
+              Type: struct<staffName:string,staffId:int,emailId:string,status:string>
+            - Name: metadata
+              Type: struct<appName:string,eventType:string,sourceTimestamp:timestamp>
+          Location: !Sub
+            - s3://${EnvLower}-sample-events-${AWS::AccountId}/
+            - { EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower] }
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters:
+              serialization.format: "1"
+
+  SampleEventsS3CrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - ${EnvLower}-sample-events-glue-s3-crawler-role
+        - { EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower] }
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "glue.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: !Sub
+            - ${EnvLower}-sample-events-glue-s3-crawler-policy
+            - { EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower] }
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub
+                  - "arn:aws:s3:::${EnvLower}-sample-events-${AWS::AccountId}/*"
+                  - {
+                      EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower],
+                    }
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt SampleBucketKmsKey.Arn
+
+  SampleEventsS3Crawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: SampleEventsGlueTable
+    Properties:
+      Name: !Sub
+        - ${EnvLower}-sample-events-s3-crawler
+        - { EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower] }
+      Description: Scans S3 and load new partitions
+      DatabaseName: !Ref SampleEventsGlueDatabase
+      Role: !GetAtt SampleEventsS3CrawlerRole.Arn
+      # Run Every 30 minutes
+      # <second> <minute> <hour> <day-of-month> <month> <day-of-week> <command>
+      Schedule:
+        ScheduleExpression: cron(15,45 * ? * * *)
+      Targets:
+        S3Targets:
+          - Path: !Sub
+              - "s3://${EnvLower}-sample-events-${AWS::AccountId}/"
+              - EnvLower: !FindInMap [EnvMap, !Ref Environment, EnvLower]
+      SchemaChangePolicy:
+        DeleteBehavior: DELETE_FROM_DATABASE
+        UpdateBehavior: LOG
+      Configuration: '{
+        "Version":1.0,
+        "CrawlerOutput":{
+        "Partitions": {"AddOrUpdateBehavior":"InheritFromTable"},
+        "Tables":{"AddOrUpdateBehavior":"MergeNewColumns"}}}'
+
+Outputs:
+  SampleEventsStreamName:
+    Description: "Name of sample events stream"
+    Value: !Ref "SampleEventsStream"
+    Export:
+      Name: !Sub "SampleEventsStreamName-${Environment}"
+
+  SampleEventsStreamARN:
+    Description: "Messaging events stream ARN"
+    Value: !GetAtt "SampleEventsStream.Arn"
+    Export:
+      Name: !Sub "SampleEventsStreamNameARN-${Environment}"
