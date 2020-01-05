@@ -446,9 +446,3 @@ Outputs:
     Value: !Ref "SampleEventsStream"
     Export:
       Name: !Sub "SampleEventsStreamName-${Environment}"
-
-  SampleEventsStreamARN:
-    Description: "Messaging events stream ARN"
-    Value: !GetAtt "SampleEventsStream.Arn"
-    Export:
-      Name: !Sub "SampleEventsStreamNameARN-${Environment}"
